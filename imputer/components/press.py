@@ -776,11 +776,12 @@ class SetTransformerComponent(exPressPytorchComponent):
         all_preds = torch.cat([o["preds"] for o in outputs], dim=0)
         all_targets = torch.cat([o["labels"] for o in outputs], dim=0)
         actor_global_index = torch.cat([o["actor_global_index"] for o in outputs], dim=0)
+        all_visible = torch.cat([o["visible"] for o in outputs], dim=0)
 
         # error를 측정할 때는 모든 선수 대상으로 계산
         W = all_preds.shape[1]
         #mae, mse_loss, euclidean_dist, cosine_similarity = self.model.criterion(all_preds[:, W//2, :, :].unsqueeze(1), all_targets[:, W//2, :, :].unsqueeze(1), actor_global_index)
-        mae, mse_loss, euclidean_dist, cosine_similarity = self.model.criterion(all_preds, all_targets, actor_global_index)
+        mae, mse_loss, euclidean_dist, cosine_similarity = self.model.criterion(all_preds, all_targets, actor_global_index, all_visible)
 
 
         if dataset.use_transform:
@@ -862,6 +863,7 @@ class SetTransformerComponent(exPressPytorchComponent):
             all_preds = torch.cat([o["preds"] for o in outputs], dim=0)    # [batch_size, window, n_agents, 2 or 4]
             all_targets = torch.cat([o["labels"] for o in outputs], dim=0) # [batch_size, window, n_agents, 2 or 4]
             all_actor_global_index = torch.cat([o["actor_global_index"] for o in outputs], dim=0)
+            all_visible = torch.cat([o["visible"] for o in outputs], dim=0)
             #freeze_frame_mask = torch.cat([batch["freeze_frame_mask"] for batch in data_loader], dim=0)
             freeze_frame_mask = None
             # all_preds = torch.cat(outputs)  #  리스트 -> Tensor 변환
@@ -869,7 +871,7 @@ class SetTransformerComponent(exPressPytorchComponent):
 
             W = all_preds.shape[1]
             #mae, mse_loss, euclidean_dist, cosine_similarity = self.model.criterion(all_preds[:, W//2, :, :].unsqueeze(1), all_targets[:, W//2, :, :].unsqueeze(1), all_actor_global_index)#, freeze_frame_mask)# freeze_frame_mask[: , W//2, :].unsqueeze(1))
-            mae, mse_loss, euclidean_dist, cosine_similarity = self.model.criterion(all_preds, all_targets, all_actor_global_index)#, freeze_frame_mask)# freeze_frame_mask[: , W//2, :].unsqueeze(1))
+            mae, mse_loss, euclidean_dist, cosine_similarity = self.model.criterion(all_preds, all_targets, all_actor_global_index, all_visible)#, freeze_frame_mask)# freeze_frame_mask[: , W//2, :].unsqueeze(1))
             if len(mae) == 4:
                 print(
                     f"vx_error: {mae[0].item()}, "

@@ -21,7 +21,7 @@
         },
         "DataConfig": {
             "batch_size": 32,
-            "num_workers": 80,
+            "num_workers": 8,
             "pin_memory": true,
             "prefetch_factor": 2
         },

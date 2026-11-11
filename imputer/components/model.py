@@ -15,6 +15,7 @@ import torch.nn.functional as F
 from torch_geometric.nn import GCNConv, SAGEConv
 import pytorch_lightning as pl
 from typing import Any, Dict, List, Optional, Union
+import copy
 import math
 from xgboost import XGBRegressor
 import imputer.config as config  # categorical feature 목록 가져오기
@@ -172,13 +173,13 @@ class CustomTransformerEncoderLayer(nn.Module):
 class CustomTransformerEncoder(nn.Module):
     def __init__(self, encoder_layer, num_layers):
         super().__init__()
-        self.layers = nn.ModuleList([encoder_layer for _ in range(num_layers)])
+        self.layers = nn.ModuleList([copy.deepcopy(encoder_layer) for _ in range(num_layers)])  # 깊이마다 독립된 layer
         self.norm = nn.LayerNorm(encoder_layer.linear2.out_features)
 
-    def forward(self, query, key, value):
+    def forward(self, query, key, value, src_key_padding_mask=None):
         output = query
         for layer in self.layers:
-            output = layer(output, key, value)
+            output = layer(output, key, value, src_key_padding_mask=src_key_padding_mask)
         return self.norm(output)
     
 # class SAB(nn.Module):
@@ -265,11 +266,30 @@ class AgentAwareBlock(nn.Module):
         return x
     
 class SetTransformer(nn.Module):
+    """Identity-based set transformer.
+
+    Every player has one token in every snapshot (identity is given, so there is no association step).
+    A token carries the player's feature vector X (role/side/... embeddings) plus the snapshot observation:
+    obs_xy (x, y) and a visible flag. Hidden players (visible=0) get obs_xy zeroed, so a hidden token cannot read
+    a stale coordinate; it infers its state through self-attention over the identified teammates and opponents.
+    Positions of visible players are predicted as obs_xy + delta.
+
+    Inputs (x, y in the same normalised units as the position labels, i.e. divided by field length / width):
+        X:       (B, W, N, F) per-player features
+        obs_xy:  (B, W, N, 2) observed (x, y); values at hidden players are ignored (may be NaN)
+        visible: (B, W, N)    1/True if the player is in the snapshot
+        valid:   (B, W, N)    optional; True where the player exists at that timestep, False for padding slots / absent timesteps
+                              (excluded as attention key in both the player axis and the time axis)
+    Output: (B, W, N, dim_output); dim_output 6 -> (vx, vy, x, y, ax, ay), 4 -> (vx, vy, x, y), 2 -> (x, y)
+    """
     def __init__(self, dim_input, num_outputs, dim_output, num_inds=32, 
                  dim_hidden=256, num_heads=8, dim_feedforward=1024, dropout=0.1, 
-                 num_seeds=4, num_layers=6, ln=False, categorical_indices=None):
+                 num_seeds=4, num_layers=6, ln=False, categorical_indices=None, categorical_features=None):
         
         super(SetTransformer, self).__init__()
+
+        # {이름: 클래스 수}. None이면 config.categorical_features. categorical_indices의 열 순서는 이름을 정렬한 순서와 같아야 함
+        self.categorical_features = categorical_features if categorical_features is not None else config.categorical_features
 
         self.categorical_indices = categorical_indices if categorical_indices is not None else []
         self.num_indices = [i for i in range(dim_input) if i not in self.categorical_indices]
@@ -277,8 +297,8 @@ class SetTransformer(nn.Module):
         self.dim_output = dim_output
 
         self.categorical_embeddings = nn.ModuleDict()
-        for cat in config.categorical_features:
-            num_classes = config.categorical_features[cat]  # 클래스 개수
+        for cat in self.categorical_features:
+            num_classes = self.categorical_features[cat]  # 클래스 개수
             embed_dim = int(math.sqrt(num_classes))  # 임베딩 차원 설정
             self.categorical_embeddings[cat] = nn.Embedding(num_classes+1, embed_dim, padding_idx=0)  # 0은 패딩 인덱스
 
@@ -286,26 +306,9 @@ class SetTransformer(nn.Module):
         total_embedding_dim = sum([emb.embedding_dim for emb in self.categorical_embeddings.values()])
         new_input_dim = dim_input - len(self.categorical_indices) + total_embedding_dim  # 수정
 
-        self.input_fc = nn.Linear(new_input_dim, dim_hidden)
-        self.freeze_fc = nn.Linear(5, dim_hidden)
+        self.input_fc = nn.Linear(new_input_dim + 3, dim_hidden)  # +3: obs_x, obs_y, visible
 
         # batch_first=False: (Seq, Batch, Feature) -> Spatial Transformer관점에서는 (N, B*W, F)
-        # self.player_pos_encoder = PositionalEncoding(dim_hidden)
-        self.snapshot_encoder1 = CustomTransformerEncoder(
-            CustomTransformerEncoderLayer(dim_hidden, num_heads, dim_hidden * 8, dropout, activation="gelu"),
-            num_layers,
-        )
-
-        self.snapshot_encoder2 = CustomTransformerEncoder(
-            CustomTransformerEncoderLayer(dim_hidden, num_heads, dim_hidden * 8, dropout, activation="gelu"),
-            num_layers,
-        )
-
-        self.snapshot_encoder3 = CustomTransformerEncoder(
-            CustomTransformerEncoderLayer(dim_hidden, num_heads, dim_hidden * 8, dropout, activation="gelu"),
-            num_layers,
-        )
-
         self.player_encoder1 = TransformerEncoder(
             TransformerEncoderLayer(dim_hidden, num_heads, dim_hidden * 8, dropout, activation="gelu"),
             num_layers,
@@ -320,17 +323,22 @@ class SetTransformer(nn.Module):
 
         self.fc_v = nn.Sequential(nn.Linear(dim_hidden, dim_hidden), nn.GELU(), nn.Linear(dim_hidden, 2))  # 속도 예측용
 
-        self.fc_xy = nn.Sequential(  # 위치 예측
+        self.fc_xy = nn.Sequential(  # 위치 예측: 보이는 선수는 obs_xy에 더해지는 residual, 가려진 선수는 절대 좌표
             nn.Linear(dim_hidden, dim_hidden),
             nn.GELU(),
-            nn.Linear(dim_hidden, 2),  # 최종 출력 shape을 (B, N, output_dim)으로 맞춤
+            nn.Linear(dim_hidden, 2),
         ) 
 
-    def forward(self, X, ff=None):
-        B, W, N, F = X.shape  # (Batch, Window, Players, Features)   
+        if dim_output == 6:
+            self.fc_a = nn.Sequential(nn.Linear(dim_hidden, dim_hidden), nn.GELU(), nn.Linear(dim_hidden, 2))  # 가속도 예측용
 
-        
-        # ff.shape (Bs, Window, Agnets, freeze_frame's features)  
+    def forward(self, X, obs_xy, visible, valid=None):
+        B, W, N, F = X.shape  # (Batch, Window, Players, Features)
+
+        # 가려진 선수의 관측 좌표는 0으로 만든다 (NaN이어도 where가 걸러냄). 이 값이 residual의 기준점이 되므로 가려진 선수에는 residual이 더해지지 않는다.
+        vis = visible.bool().unsqueeze(-1)  # (B, W, N, 1)
+        obs_xy = torch.where(vis, obs_xy, torch.zeros_like(obs_xy))  # (B, W, N, 2)
+
         # 연속형 feature와 카테고리 feature 분리
         X_continuous = X[..., self.num_indices]  # 연속형 변수
         X_categorical = X[..., self.categorical_indices].long()  
@@ -339,7 +347,7 @@ class SetTransformer(nn.Module):
         embedded_features = []
 
         if len(self.categorical_indices) != 0:
-            for i, cat in enumerate(sorted(config.categorical_features.keys())):  # 순서 보장
+            for i, cat in enumerate(sorted(self.categorical_features.keys())):  # 순서 보장
                 embedded_features.append(self.categorical_embeddings[cat](X_categorical[..., i]))
             
         # 임베딩된 feature들을 결합
@@ -347,41 +355,28 @@ class SetTransformer(nn.Module):
             X_embedded = torch.cat(embedded_features, dim=-1)
             X = torch.cat([X_continuous, X_embedded], dim=-1)
 
-        # Step1. input projection
-        X = self.input_fc(X)  # (B, W, N, dim_hidden)
-        # Step 2. freeze frame projection
-        if ff is not None:
-            ff = self.freeze_fc(ff)  # (B, W, N', dim_hidden)
+        # Step1. input projection: 선수 token = [identity/role feature, obs_xy, visible]
+        X = self.input_fc(torch.cat([X, obs_xy, vis.to(obs_xy.dtype)], dim=-1))  # (B, W, N, dim_hidden)
 
-        # X = self.player_pos_encoder(X)
-        # X = self.player_encoder(X)  # , src_key_padding_mask=padding_mask)  # (N+N', B*W, dim_hidden)
+        # valid: padding slot은 attention에서 제외. 전부 padding인 스냅샷은 NaN 방지를 위해 마스크하지 않음
+        pad, pad_t = None, None
+        if valid is not None:
+            pad = ~valid.bool()
+            pad_t = pad.permute(0, 2, 1).reshape(B * N, W)  # 시간축: 선수별로 존재하지 않는 timestep을 key에서 제외 (B*N, W)
+            pad_t = pad_t & ~pad_t.all(dim=-1, keepdim=True)
+            pad = pad & ~pad.all(dim=-1, keepdim=True)
+            pad = pad.reshape(B * W, N)  # (B*W, N), True인 위치는 attention에서 제외
 
         for i in range(4):
-            # Step 3. spatial transformer1
-            if ff is not None:
-                X = torch.cat([X, ff], dim=2)  # (B, W, N+N', dim_hidden)
-                X = (
-                    X.permute(2, 0, 1, 3)  # (B, W, N+N', dim_hidden) -> (N+N', B, W, dim_hidden)
-                    .contiguous()  # 메모리 연속성 확보
-                    .view(22 + N, B * W, -1)  # (N+N', B, W, dim_hidden) -> (N+N', B*W, dim_hidden)
-                )
-            else:
-                X = (
-                    X.permute(2, 0, 1, 3)  # (B, W, N+N', dim_hidden) -> (N+N', B, W, dim_hidden)
-                    .contiguous()  # 메모리 연속성 확보
-                    .view(N, B * W, -1)  # (N+N', B, W, dim_hidden) -> (N+N', B*W, dim_hidden)
-                )
-           
-            X_player = self.player_encoder1(X[:N]) # (3) self-attention(Q=K=V=event vector)
-            X_snapshot1 = self.snapshot_encoder1(X_player, X[N:], X[N:]) # (4) cross-attention(Q=event vector, K=V=snapshot vector)
-            X_snapshot2 = self.snapshot_encoder2(X[N:], X_player, X_player) # (5) cross-attention(Q=snapshot vector K=V=event vector)
-            X = self.snapshot_encoder3(X_snapshot1, X_snapshot2, X_snapshot2) # (6) cross-attention(Q=event encoding vector K=V=snapshot encoding vector)
+            # Step 2. spatial transformer: 모든 선수 token 사이의 self-attention
+            X = (
+                X.permute(2, 0, 1, 3)  # (B, W, N, dim_hidden) -> (N, B, W, dim_hidden)
+                .contiguous()  # 메모리 연속성 확보
+                .view(N, B * W, -1)  # (N, B, W, dim_hidden) -> (N, B*W, dim_hidden)
+            )
+            X = self.player_encoder1(X, src_key_padding_mask=pad)  # (3) self-attention(Q=K=V=player tokens)
 
-            # Step 4. temporal transformer1
-            X = X[
-                :N, :, :
-            ]  # freeze_frame정보는 temporal정보 학습 못함: (N+N', B*W, dim_hidden) -> (N, B*W, dim_hidden)
-   
+            # Step 3. temporal transformer
             X = (
                 X.view(N, B, W, -1)  # (N, B*W, dim_hidden) -> (N, B, W, dim_hidden)
                 .permute(2, 1, 0, 3)  # (N, B, W, dim_hidden) -> (W, B, N, dim_hidden)
@@ -390,23 +385,23 @@ class SetTransformer(nn.Module):
             )
         
             X = self.time_pos_encoder(X) 
-            X = self.time_encoder1(X)  # (7) self-attention: (W, B*N, dim_hidden)
+            X = self.time_encoder1(X, src_key_padding_mask=pad_t)  # (7) self-attention: (W, B*N, dim_hidden)
    
-            # Step 5. spatial transformer2
             X = (
                 X.view(W, B, N, -1)  # (W, B*N, dim_hidden) -> (W, B, N, dim_hidden)
                 .permute(1, 0, 2, 3)  # (W, B, N, dim_hidden) -> (B, W, N, dim_hidden)
                 .contiguous()  # 메모리 연속성 확보
             )
 
+        xy_pred = self.fc_xy(X) + obs_xy  # 보이는 선수: obs_xy + delta, 가려진 선수: obs_xy=0이므로 delta (절대 좌표)
         if self.dim_output == 4:
-            v_pred = self.fc_v(X)  # (B, N, dim_hidden) -> (B, N, 2)
-            xy_pred = self.fc_xy(X)  # (B, N, dim_hidden) -> (B, N, 2)
-            output = torch.cat([v_pred, xy_pred], dim=-1)  # (B, N, 4)
+            output = torch.cat([self.fc_v(X), xy_pred], dim=-1)  # (B, W, N, 4)
+        elif self.dim_output == 6:
+            output = torch.cat([self.fc_v(X), xy_pred, self.fc_a(X)], dim=-1)  # (B, W, N, 6): (vx, vy, x, y, ax, ay)
         else:
-            output = self.fc_xy(X)  # (B, N, 2)  ->  (x,y)
+            output = xy_pred  # (B, W, N, 2)  ->  (x,y)
 
-        return output  # 최종 예측 좌표 (x, y) or (vx, vy, x, y)
+        return output
 
 class TimeLSTM(nn.Module):
     def __init__(self, input_size, hidden_size, cuda_flag=True, bidirectional=True):
@@ -484,58 +479,97 @@ class seq_lstm(nn.Module):
         outs = self.relu(outs)
         return outs
 
-def balanced_loss(preds, targets, actor_global_index):
+# --- loss 설정 -------------------------------------------------------------------------------------------
+# 모든 성분은 TARGET_SCALE로 나눈 단위에서 Huber(SmoothL1)로 계산함. TARGET_SCALE은 "달성 가능한 오차" 기준이라
+# 기준선 성능에서 각 항이 비슷한 크기가 되고, 그 위에서 아래 가중치가 우선순위를 나타냄.
+# 0.7 / 0.2 / 0.1은 논문에서 물려받은 값이고 한 번도 유도된 적이 없음. scale을 이렇게 맞추는 목적은 이 가중치를 나중에 바꿨을 때
+# 효과를 예측할 수 있게 하는 것임.
+LOSS_W_POS, LOSS_W_VEL, LOSS_W_COS = 0.7, 0.2, 0.1  # 위치 / 속도 / 방향(cosine) 가중치
+LOSS_W_ACC = 0.05  # 가속도 가중치. 속도 항과 분리되어 있어 0으로 두면 속도 항은 그대로임. 0.05는 "작게"라는 취지로 정한 값이며 튜닝하지 않았음
+LOSS_W_VISIBLE, LOSS_W_HIDDEN = 0.5, 0.5  # visible / hidden 부분집합 loss를 따로 평균낸 뒤 합치는 가중치 (튜닝하지 않은 값)
+HUBER_BETA = 1.0  # TARGET_SCALE 단위(1.0 = 달성 가능한 오차 한 개)에서의 Huber 전환점
+HEADING_MIN_SPEED = 0.5  # m/s. 정답 속력이 이보다 작으면 cosine(방향) 항에서 제외함.
+# 근거: DFL 25Hz tracking 한 경기(DFL-MAT-J04034) 앞 9분, 한 팀 11명에서 1스텝 중심차분 속도의 방향이 +-5프레임 평활 속도의 방향과
+# 벗어나는 정도를 쟀음(제가 측정). 0.5 m/s 미만에서 p90 편차가 18도를 넘고 이상에서는 10도 이하. 라벨은 Savitzky-Golay 평활이라 더 작을 수 있으나 재측정하지 않았음.
+# 성분별 scale. 라벨 단위 기준(x, y는 field 길이/폭으로 나눈 값, v는 m/s, a는 m/s^2). 출처는 성분마다 다름:
+#  x, y : 2.1 m (달성 가능한 오차). 독립적으로 측정된 두 값에 가깝다: (1) Phase 0 측정(coordinator 보고, 이 에이전트가 재측정하지 않음): 마지막 관측
+#         위치를 그대로 쓸 때 중앙값 오차 1 s 2.05 m / 2 s 3.94 m / 5 s 8.56 m. (2) SCHEMA.md가 보고하는 360 vs tracking 위치 중앙값 오차 2.19 m
+#         (visible 선수의 예측은 obs_xy에 대한 residual이므로 이 값이 하한). 2.1 m에서 기준선 오차(위치 2 m, 속도 1.9 m/s)의 위치 항과 속도 항이
+#         가중치 비율(0.7 : 0.2)대로 나옴(smoke 6g).
+#         알려진 근사: visible 선수의 달성 가능한 오차(약 2.19 m, 360 관측 잡음)와 hidden 선수의 것(대략 4 m, 전형적인 prev_dt에서)은 다르며,
+#         한 scale로 둘 다 맞출 수 없음. loss가 두 부분집합을 따로 평균내므로 결함이 아니라 알려진 근사임. 부분집합별 scale은 두지 않음.
+#         라벨 단위로 환산: x = 2.1/105 = 0.020000, y = 2.1/68 = 0.030882 (config.field_length=105, field_width=68).
+#  vx, vy : 2.0 m/s (달성 가능한 오차). Phase 0 측정(coordinator 보고, 재측정 안 함): 360 sighting 중심차분의 성분별 RMSE 1.9~2.05 m/s, 실제 중앙값 속력 2.19 m/s.
+#  ax, ay : 1.3, 1.1 m/s^2 (한계 표준편차이며 달성 가능한 오차가 아님). Phase 0에서 2차 차분 가속도가 정답과 상관 0.11 이하라 달성 가능한 오차 자체가 없음.
+#         값은 제가 DFL-MAT-J04034 앞 9분 11명의 25Hz 위치를 5프레임 평활 후 0.4 s 차분해 구한 표준편차(ax 1.328, ay 1.141). Phase-2 라벨(Savitzky-Golay, 6 m/s^2 clip)에서 잰 값이 아님.
+TARGET_SCALE = {"vx": 2.0, "vy": 2.0, "x": 2.1 / 105, "y": 2.1 / 68, "ax": 1.3, "ay": 1.1}
+_COMPONENTS = {2: ("x", "y"), 4: ("vx", "vy", "x", "y"), 6: ("vx", "vy", "x", "y", "ax", "ay")}
+
+
+def _masked_loss(preds, targets, comps):
+    """preds, targets: (T, D) 한 부분집합의 token들. standardised Huber 항을 위치/속도/가속도/방향으로 묶어 가중합함."""
+    scale = torch.tensor([TARGET_SCALE[c] for c in comps], device=preds.device, dtype=preds.dtype)
+    huber = F.smooth_l1_loss(preds / scale, targets / scale, beta=HUBER_BETA, reduction="none")  # (T, D)
+    pos_cols = [i for i, c in enumerate(comps) if c in ("x", "y")]
+    loss_pos = huber[:, pos_cols].mean()
+    if "vx" not in comps:
+        return loss_pos
+    vel_cols = [i for i, c in enumerate(comps) if c in ("vx", "vy")]
+    loss = LOSS_W_POS * loss_pos + LOSS_W_VEL * huber[:, vel_cols].mean()
+    acc_cols = [i for i, c in enumerate(comps) if c in ("ax", "ay")]
+    if acc_cols:
+        loss = loss + LOSS_W_ACC * huber[:, acc_cols].mean()
+    # 방향: 속력이 작으면 atan2(vy, vx)가 의미 없으므로 정답 속력이 HEADING_MIN_SPEED를 넘는 token만 사용
+    moving = targets[:, :2].norm(dim=1) > HEADING_MIN_SPEED
+    if moving.any():
+        loss = loss + LOSS_W_COS * (1 - F.cosine_similarity(preds[moving, :2], targets[moving, :2], dim=1)).mean()
+    return loss
+
+
+def balanced_loss(preds, targets, actor_global_index, visible, valid=None):
     """
-    MSE Loss를 계산하면서, global_idx에 해당하는 데이터를 제외함.
+    중앙 timestep의 (vx, vy, x, y, ax, ay) 예측에 대한 loss. visible과 hidden 선수를 따로 평균낸 뒤
+    LOSS_W_VISIBLE / LOSS_W_HIDDEN으로 합침 (한쪽 부분집합이 비면 남은 쪽만 사용).
+    라벨이 NaN인 token(뛰지 않는 선수)과 valid=False(padding)인 token은 제외함.
+    preds, targets: (B, W, N, D)   visible, valid: (B, W, N)
+    반환: (mae, loss, euclidean_dist[m], cosine_similarity)
     """
 
     B, W, N, feat_dim  = targets.shape
     preds = preds[:, W//2, :, :]
     targets = targets[:, W//2, :, :]
+    visible = visible[:, W//2, :].bool()
     mask = ~torch.isnan(targets).any(dim=-1)
+    if valid is not None:
+        mask = mask & valid[:, W//2, :].bool()
 
-    batch_indices = torch.arange(targets.shape[0], device=targets.device)
+    comps = _COMPONENTS[feat_dim]
+    preds_masked, targets_masked, visible_masked = preds[mask], targets[mask], visible[mask]
 
-    # for b in range(B):
-    #     mask[b, :, global_idx[b]] = False  # 각 배치의 global_idx에 해당하는 값 제외
-    #mask[batch_indices, :, global_idx]= False #mask[batch_indices, seq_len, global_idx]= False 
-
-    preds_masked = preds[mask].view(-1, feat_dim)
-    targets_masked = targets[mask].view(-1, feat_dim)
-
-    cosine_sim = None  # metric
-    cosine_loss = 0.0  # loss
+    total, weight_sum = preds.sum() * 0.0, 0.0
+    for subset, w in ((visible_masked, LOSS_W_VISIBLE), (~visible_masked, LOSS_W_HIDDEN)):
+        if subset.any():
+            total = total + w * _masked_loss(preds_masked[subset], targets_masked[subset], comps)
+            weight_sum += w
+    loss = total / weight_sum if weight_sum > 0 else total
 
     scale = torch.tensor(
         [config.field_length, config.field_width],
         device=preds_masked.device,
         dtype=preds_masked.dtype
     )
+    xy_cols = [i for i, c in enumerate(comps) if c in ("x", "y")]
+    euclidean_dist = torch.norm((preds_masked[:, xy_cols] - targets_masked[:, xy_cols]) * scale, dim=1)
 
-    if feat_dim==4:
-        cosine_similarity = F.cosine_similarity(
-            preds_masked[:, :2], targets_masked[:, :2], 
-            dim=1
-        ) 
-        cosine_loss = (1 - cosine_similarity).mean() # 속도 방향은 cosine loss
-        loss_v = F.smooth_l1_loss(preds_masked[:, :2], targets_masked[:, :2])  # 속도의 크기 차이는 Smooth L1 (Huber Loss)
-        #loss_v = F.mse_loss(preds_masked[:, :2], targets_masked[:, :2])
-        loss_xy = F.mse_loss(preds_masked[:, 2:], targets_masked[:, 2:])  # 위치 차이는 MSE Loss
-        mse_loss = 0.7 * loss_xy + 0.2 * loss_v + 0.1 * cosine_loss # 가중치 조정
-        #mse_loss = 0.7 * loss_xy + 0.3 * loss_v
-        euclidean_dist = torch.norm(preds_masked[:, 2:] * scale - targets_masked[:, 2:] * scale, dim=1) 
+    if "vx" in comps:
+        moving = targets_masked[:, :2].norm(dim=1) > HEADING_MIN_SPEED
+        cosine_similarity = F.cosine_similarity(preds_masked[moving, :2], targets_masked[moving, :2], dim=1)
     else:
         cosine_similarity = torch.tensor(float('nan'))  # 속도 벡터가 없으니 의미 없음
-        mse_loss = F.mse_loss(preds_masked, targets_masked)  # 기본적으로는 MSE 적용
-        euclidean_dist = torch.norm(preds_masked[:, :2] * scale - targets_masked[:, :2] * scale, dim=1) 
-    
-        # print(f"preds_masked: {preds_masked}, targets_masked: {targets_masked}")
-        # print(f"mse_loss: {mse_loss}, euclidean_dist: {euclidean_dist}, mae={torch.abs(preds_masked - targets_masked)}")
-        # print(f"enuclidean_dist mean: {euclidean_dist.mean()}, mae mean: {torch.abs(preds_masked - targets_masked).mean()}")
-     
+
     mae = torch.abs(preds_masked - targets_masked)
     
-    return mae.mean(dim=0), mse_loss, euclidean_dist.mean(), cosine_similarity.mean()
+    return mae.mean(dim=0), loss, euclidean_dist.mean(), cosine_similarity.mean()
 
 class XGBoostModel():
     """Wrapper to unify constructor signature with other models."""
@@ -556,6 +590,7 @@ class SetTransformerModel(pl.LightningModule):
             dim_output=sample_output.shape[-1],
             num_outputs=sample_input.shape[-1],
             categorical_indices=categorical_indices,
+            categorical_features=sample.get("categorical_features"),
             **model_config,
 
         )
@@ -573,16 +608,16 @@ class SetTransformerModel(pl.LightningModule):
         self.save_hyperparameters(ignore=['train_dataset'])
         self.optimizer_params = optimizer_params if optimizer_params else {"lr": 1e-3}
 
-    def forward(self, x, ff=None):
-        return self.model(x, ff)  # ✅ 기본 forward 메서드
+    def forward(self, x, obs_xy, visible, valid=None):
+        return self.model(x, obs_xy, visible, valid)  # ✅ 기본 forward 메서드
 
     def step(self, batch: Any):
         inputs, targets, actor_global_index = batch["features"], batch["labels"], batch["actor_global_index_lst"]
-        freeze_frame = batch.get("freeze_frame", None)
+        obs_xy, visible, valid = batch["obs_xy"], batch["visible"], batch.get("valid", None)
 
-        outputs = self.forward(inputs, freeze_frame)
+        outputs = self.forward(inputs, obs_xy, visible, valid)
 
-        mae, mse_loss, euclidean_dist, cosine_similarity = self.criterion(outputs, targets, actor_global_index)
+        mae, mse_loss, euclidean_dist, cosine_similarity = self.criterion(outputs, targets, actor_global_index, visible, valid)
 
         return mae, mse_loss, euclidean_dist, cosine_similarity
     
@@ -615,14 +650,15 @@ class SetTransformerModel(pl.LightningModule):
     
     def predict_step(self, batch, batch_idx):
         inputs, targets, actor_global_index = batch["features"], batch["labels"], batch["actor_global_index_lst"]
-        freeze_frame = batch.get("freeze_frame", None)
-        preds = self(inputs, freeze_frame)  # 예측을 위한 forward 메서드 호출
+        obs_xy, visible, valid = batch["obs_xy"], batch["visible"], batch.get("valid", None)
+        preds = self(inputs, obs_xy, visible, valid)  # 예측을 위한 forward 메서드 호출
 
         #return preds        
         return {
             "preds": preds,
             "labels": targets,
             "actor_global_index": actor_global_index,
+            "visible": visible,
         }
 
     def configure_optimizers(self):

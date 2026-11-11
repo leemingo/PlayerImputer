@@ -7,10 +7,14 @@ from pathlib import Path
 import ast
 # Third-party library imports
 import mlflow
+import pytorch_lightning as pl
+from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
+from torch.utils.data import DataLoader
 
 # Local application imports
 from datatools.preprocess import extract_match_id
 from imputer.datasets import ImputerDataset
+from imputer import phase2
 from imputer.components import press
 from imputer.components.model import SetTransformerModel, AgentImputer, XGBoostModel
 
@@ -146,7 +150,7 @@ def train(args, params, game_ids, data_path, version):
     """Run training for the specified model."""
 
     # 변수 1개(fold_index)로 fold하는 과정
-    fold_index = 5
+    fold_index = args.fold_index
     fold_index = fold_index % len(game_ids) # 리스트 길이를 넘어서도 순환하기 위해 사용
     rotated_ids = game_ids[fold_index:] + game_ids[:fold_index]
 
@@ -192,21 +196,83 @@ def train(args, params, game_ids, data_path, version):
 
     return component
 
+PHASE2_STATS_FILE = "phase2_stats.json"
+
+
+def _phase2_loader(dataset, params, shuffle):
+    return DataLoader(dataset, shuffle=shuffle, collate_fn=phase2.collate_phase2, **params["DataConfig"])
+
+
+def _phase2_trainer(args, params):
+    """Same callbacks as exPressPytorchComponent, but devices come from --devices (the component hardcodes devices=[3])."""
+    checkpoint_callback = ModelCheckpoint(monitor="val_loss", dirpath=params["save_path"], filename="best_model", **params["ModelCheckpoint"])
+    early_stop_callback = EarlyStopping(monitor="val_loss", **params["EarlyStopConfig"])
+    return pl.Trainer(callbacks=[checkpoint_callback, early_stop_callback], enable_progress_bar=True, logger=True,
+                      devices=args.devices, **params["TrainerConfig"])
+
+
+def train_phase2(args, params, match_ids=None):
+    """Train SetTransformerModel (dim_output 6) on the Phase 2 dataset. match_ids: optional {"train": [...], "valid": [...], "test": [...]} (default: splits.csv)."""
+    root = args.data_dir or phase2.PHASE2_ROOT
+    match_ids = match_ids or {}
+    # normalisation statistics are fitted on the train matches only (fit_stats refuses any non-train match) and reused for valid / test
+    train_dataset = phase2.Phase2Windows("train", args.window, match_ids=match_ids.get("train"), root=root)
+    stats = train_dataset.stats
+    stats_path = os.path.join(params["save_path"], PHASE2_STATS_FILE)
+    with open(stats_path, "w") as f:
+        json.dump(stats, f, indent=1)
+    print(f"Saved normalisation statistics (fit on {len(stats['fit_matches'])} train matches, window {stats['window']}) to {stats_path}")
+    valid_dataset = phase2.Phase2Windows("valid", args.window, stats=stats, match_ids=match_ids.get("valid"), root=root)
+    test_dataset = phase2.Phase2Windows("test", args.window, stats=stats, match_ids=match_ids.get("test"), root=root)
+    print(f"samples: train {len(train_dataset)}, valid {len(valid_dataset)}, test {len(test_dataset)}")
+
+    model = SetTransformerModel(train_dataset, params.get("ModelConfig"), params.get("OptimizerConfig"))
+    trainer = _phase2_trainer(args, params)
+    mlflow.set_experiment(f"{args.model}_experiments")
+    with mlflow.start_run(run_name=f"trial_{args.trial}"):
+        trainer.fit(model, _phase2_loader(train_dataset, params, True), _phase2_loader(valid_dataset, params, False))
+        for name, dataset in (("valid", valid_dataset), ("test", test_dataset)):
+            print(f"{'='*40}\n{name.capitalize()} Metrics\n{'='*40}")
+            print(trainer.test(model, _phase2_loader(dataset, params, False), ckpt_path="best"))
+    return model
+
+
+def test_phase2(args, params):
+    """Evaluate best_model.ckpt of a finished run on the test matches with the saved train statistics."""
+    root = args.data_dir or phase2.PHASE2_ROOT
+    with open(os.path.join(params["save_path"], PHASE2_STATS_FILE)) as f:
+        stats = json.load(f)
+    test_dataset = phase2.Phase2Windows("test", args.window, stats=stats, root=root)  # raises if args.window != stats["window"]
+    model = SetTransformerModel(test_dataset, params.get("ModelConfig"), params.get("OptimizerConfig"))
+    trainer = _phase2_trainer(args, params)
+    print(trainer.test(model, _phase2_loader(test_dataset, params, False), ckpt_path=os.path.join(params["save_path"], "best_model.ckpt")))
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", type=str, choices=["train", "test"], default="train")
     parser.add_argument("--model", type=str, required=True)
     parser.add_argument("--trial", type=int, required=True)
-    parser.add_argument("--data_version", type=int, required=True)
+    parser.add_argument("--dataset", type=str, choices=["imputer", "phase2"], default="imputer",
+                        help="imputer: ImputerDataset (DFL/BEPRO csv, default); phase2: Phase 2 parquet windows (dim_output 6, data_dir defaults to the Phase 2 root)")
+    parser.add_argument("--devices", type=int, default=1, help="phase2 path only: number of devices for the Lightning Trainer")
+    parser.add_argument("--data_version", type=int, required=False)
+    parser.add_argument("--fold_index", type=int, default=5, help="Rotation offset of the game id list that defines the train/valid/test split")
     parser.add_argument("--params_file", type=str, required=True)
-    parser.add_argument("--data_dir", type=str, required=True)
+    parser.add_argument("--data_dir", type=str, required=False)
     parser.add_argument("--window", type=int, default=5)
-    parser.add_argument("--xfns", type=str, nargs="+", required=True)
-    parser.add_argument("--yfns", type=str, nargs="+", required=True)
+    parser.add_argument("--xfns", type=str, nargs="+", required=False)
+    parser.add_argument("--yfns", type=str, nargs="+", required=False)
     parser.add_argument("--use_transform", action='store_true', default=True, help="Whether to apply transformation to the dataset")
     parser.add_argument("--play_left_to_right", action='store_true', default=False, help="Whether to play left to right")
 
     args = parser.parse_args()
+    if args.dataset == "imputer":
+        missing = [n for n in ("data_version", "data_dir", "xfns", "yfns") if getattr(args, n) is None]
+        if missing:
+            parser.error("the following arguments are required: " + ", ".join("--" + n for n in missing))
+    elif args.model != "transformer":
+        parser.error("--dataset phase2 supports --model transformer only")
 
     model_path = os.path.join(base_path, "stores", args.model)
     os.makedirs(model_path, exist_ok=True)
@@ -220,7 +286,16 @@ if __name__ == "__main__":
     params = all_params.get(args.model, {})  # get model's parameter
     params["save_path"] = save_path
     
-    if args.mode=="train":
+    if args.dataset == "phase2":
+        if args.mode == "train":
+            with open(os.path.join(save_path, "params.json"), "w") as f:
+                json.dump(all_params[args.model], f)
+            with open(os.path.join(save_path, "args.json"), "w") as f:
+                json.dump(vars(args), f)
+            train_phase2(args, params)
+        else:
+            test_phase2(args, params)
+    elif args.mode=="train":
         # Save all parameters to JSON file
         with open(os.path.join(save_path, "params.json"), "w") as f:
             json.dump(all_params[args.model], f)
