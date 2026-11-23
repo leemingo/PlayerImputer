@@ -1,0 +1,6 @@
+# caches and local run outputs (not part of the code)
+__pycache__/
+*.pyc
+mlruns/
+lightning_logs/
+stores/

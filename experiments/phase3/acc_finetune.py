@@ -16,6 +16,7 @@ ap.add_argument("--epochs", type=int, default=15)
 ap.add_argument("--out", required=True)
 ap.add_argument("--seed", type=int, default=0)
 ap.add_argument("--smoke", action="store_true", help="CPU, 2 train + 1 valid match, 2 batches")
+ap.add_argument("--save_epochs", default="", help="comma-separated epochs whose checkpoints are also kept (epoch<N>.ckpt), e.g. 5,12,14")
 a = ap.parse_args()
 os.makedirs(a.out, exist_ok=True)
 os.environ["MLFLOW_TRACKING_URI"] = "file:" + os.path.join(a.out, "mlruns")
@@ -65,8 +66,18 @@ class EpochLog(Callback):
         print(f"epoch {trainer.current_epoch} {time.strftime('%Y-%m-%d %H:%M:%S')} " + " ".join(f"{k}={v:.4f}" for k, v in sorted(m.items())), flush=True)
 
 
+class SaveAt(Callback):
+    def __init__(self, eps):
+        self.eps = eps
+
+    def on_train_epoch_end(self, trainer, pl_module):
+        if trainer.current_epoch in self.eps:
+            trainer.save_checkpoint(os.path.join(a.out, f"epoch{trainer.current_epoch}.ckpt"))
+
+
+save_eps = {int(e) for e in a.save_epochs.split(",") if e.strip()}
 ckcb = ModelCheckpoint(monitor="val_loss", dirpath=a.out, filename="best_model", save_top_k=1, mode="min")
-trainer = pl.Trainer(callbacks=[ckcb, EpochLog()], enable_progress_bar=False, logger=CSVLogger(a.out, name="csv"),
+trainer = pl.Trainer(callbacks=[ckcb, EpochLog()] + ([SaveAt(save_eps)] if save_eps else []), enable_progress_bar=False, logger=CSVLogger(a.out, name="csv"),
                      default_root_dir=a.out, devices=1, **tc)
 v0 = trainer.validate(model, ld(va, False), verbose=False)[0]
 print(f"start (epoch-65 weights, this w_acc): val_loss={v0['val_loss']:.4f} val_euclidean={v0['val_euclidean']:.4f}", flush=True)

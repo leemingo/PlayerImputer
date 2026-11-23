@@ -571,6 +571,29 @@ def balanced_loss(preds, targets, actor_global_index, visible, valid=None):
     
     return mae.mean(dim=0), loss, euclidean_dist.mean(), cosine_similarity.mean()
 
+
+def component_errors(preds, targets, visible, valid=None):
+    """로그 전용(loss에는 쓰지 않음). 중앙 timestep에서 visible / hidden 별 평균 오차: 위치 [m], 속도 벡터 [m/s], 가속도 벡터 [m/s^2].
+    키: pos_vis, pos_hid, vel_vis, vel_hid, acc_vis, acc_hid (출력에 없는 성분이나 빈 부분집합은 생략)."""
+    W = targets.shape[1]
+    p, t = preds[:, W // 2], targets[:, W // 2]
+    v = visible[:, W // 2].bool()
+    m = ~torch.isnan(t).any(dim=-1)
+    if valid is not None:
+        m = m & valid[:, W // 2].bool()
+    comps = _COMPONENTS[t.shape[-1]]
+    scale = torch.tensor([{"x": config.field_length, "y": config.field_width}.get(c, 1.0) for c in comps], device=p.device, dtype=p.dtype)
+    out = {}
+    for name, sub in (("vis", m & v), ("hid", m & ~v)):
+        if not sub.any():
+            continue
+        d = (p[sub] - t[sub]) * scale
+        for g, cols in (("pos", ("x", "y")), ("vel", ("vx", "vy")), ("acc", ("ax", "ay"))):
+            idx = [i for i, c in enumerate(comps) if c in cols]
+            if idx:
+                out[f"{g}_{name}"] = d[:, idx].norm(dim=1).mean()
+    return out
+
 class XGBoostModel():
     """Wrapper to unify constructor signature with other models."""
     def __init__(self, train_dataset, model_config=None, optimizer_params=None):
@@ -616,6 +639,7 @@ class SetTransformerModel(pl.LightningModule):
         obs_xy, visible, valid = batch["obs_xy"], batch["visible"], batch.get("valid", None)
 
         outputs = self.forward(inputs, obs_xy, visible, valid)
+        self._last_outputs = outputs  # validation_step의 성분별 오차 로그용 (forward를 한 번 더 하지 않기 위함)
 
         mae, mse_loss, euclidean_dist, cosine_similarity = self.criterion(outputs, targets, actor_global_index, visible, valid)
 
@@ -636,6 +660,8 @@ class SetTransformerModel(pl.LightningModule):
         self.log("val_loss", mse_loss, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
         self.log("val_euclidean", euclidean_dist, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
         #self.log("val_cosine_sim", cosine_similarity, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
+        for k, v in component_errors(self._last_outputs, batch["labels"], batch["visible"], batch.get("valid", None)).items():
+            self.log(f"val_{k}", v, on_step=False, on_epoch=True, sync_dist=True)
 
         return mse_loss
 

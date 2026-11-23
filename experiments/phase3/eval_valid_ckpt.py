@@ -10,6 +10,7 @@ from torch.utils.data import DataLoader
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--ckpt", required=True); ap.add_argument("--out", required=True); ap.add_argument("--tag", default="")
+ap.add_argument("--split", default="valid", help="split name in <PHASE2_DATA>/out/splits.csv")
 a = ap.parse_args()
 os.makedirs(a.out, exist_ok=True)
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # repo root
@@ -27,7 +28,7 @@ from common import metric_frame, bucket, EDGES, LAB
 L, Wd = 105.0, 68.0
 params = json.load(open(os.path.join(RUN1, "params.json")))
 stats = json.load(open(os.path.join(RUN1, "phase2_stats.json")))
-ds = P.Phase2Windows("valid", 5, stats=stats, root=DATA)
+ds = P.Phase2Windows(a.split, 5, stats=stats, root=DATA)
 lm = SetTransformerModel(ds, params["ModelConfig"], params["OptimizerConfig"])
 ck = torch.load(a.ckpt, map_location="cpu", weights_only=False)
 lm.load_state_dict(ck["state_dict"]); lm.eval()
